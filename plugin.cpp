@@ -1,36 +1,50 @@
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <random>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
+#include "RE/A/AIProcess.h"
 #include "RE/Skyrim.h"
 #include "SKSE/SKSE.h"
 
 namespace {
     std::atomic_bool g_running = false;
     std::thread g_worker;
-
     std::mt19937 g_rng(std::random_device{}());
-
-    std::unordered_map<RE::FormID, float> g_pendingEquipTime;
-    std::unordered_map<RE::FormID, float> g_pendingUnequipTime;
-    std::unordered_map<RE::FormID, float> g_cooldownUntil;
 
     constexpr float kUpdateRadius = 6000.0f;
     constexpr float kUpdateRadiusSquared = kUpdateRadius * kUpdateRadius;
     constexpr float kWeatherTransitionDelay = 3.0f;
-
-    RE::TESWeather* g_lastWeather = nullptr;
-    float g_lastWeatherChangeTime = 0.0f;
+    constexpr std::chrono::milliseconds kTickerInterval(500);
 
     enum class WeatherKind { kNone, kRain, kSnow };
 
-    float RandomFloat(float minValue, float maxValue) {
-        std::uniform_real_distribution<float> dist(minValue, maxValue);
-        return dist(g_rng);
-    }
+    struct GearPools {
+        std::vector<RE::TESObjectARMO*> rainHoods;
+        std::vector<RE::TESObjectARMO*> snowHoods;
+        std::vector<RE::TESObjectARMO*> rainCloaks;
+        std::vector<RE::TESObjectARMO*> snowCloaks;
+    };
+
+    struct ActorState {
+        RE::TESObjectARMO* managedHood = nullptr;
+        RE::TESObjectARMO* managedCloak = nullptr;
+
+        bool addedHoodToInventory = false;
+        bool addedCloakToInventory = false;
+
+        float nextAllowedUpdate = 0.0f;
+    };
+
+    GearPools g_pools;
+    std::unordered_map<RE::FormID, ActorState> g_actorStates;
+
+    RE::TESWeather* g_lastWeather = nullptr;
+    float g_lastWeatherChangeTime = 0.0f;
 
     float GetNowSeconds() {
         using Clock = std::chrono::steady_clock;
@@ -38,30 +52,76 @@ namespace {
         return std::chrono::duration<float>(Clock::now() - startTime).count();
     }
 
+    float RandomFloat(float minValue, float maxValue) {
+        std::uniform_real_distribution<float> dist(minValue, maxValue);
+        return dist(g_rng);
+    }
+
+    std::uint32_t HashActor(RE::FormID actorID, std::uint32_t salt) {
+        std::uint32_t x = actorID ^ salt;
+        x ^= x >> 16;
+        x *= 0x7feb352d;
+        x ^= x >> 15;
+        x *= 0x846ca68b;
+        x ^= x >> 16;
+        return x;
+    }
+
+    bool ArmorHasKeyword(RE::TESObjectARMO* armor, std::string_view keywordEditorID) {
+        return armor && armor->HasKeywordString(keywordEditorID);
+    }
+
+    bool ActorHasKeyword(RE::Actor* actor, std::string_view keywordEditorID) {
+        return actor && actor->HasKeywordString(keywordEditorID);
+    }
+
+    bool IsValidNPC(RE::Actor* actor) {
+        return actor && !actor->IsPlayerRef() && !actor->IsDead() && actor->GetActorBase();
+    }
+
+    bool IsWithinUpdateRange(RE::Actor* actor, RE::PlayerCharacter* player) {
+        if (!actor || !player) {
+            return false;
+        }
+
+        const auto a = actor->GetPosition();
+        const auto p = player->GetPosition();
+
+        const float dx = a.x - p.x;
+        const float dy = a.y - p.y;
+        const float dz = a.z - p.z;
+
+        return (dx * dx + dy * dy + dz * dz) <= kUpdateRadiusSquared;
+    }
+
+    bool IsInterior(RE::Actor* actor) {
+        auto* cell = actor ? actor->GetParentCell() : nullptr;
+        return cell ? cell->IsInteriorCell() : false;
+    }
+
     WeatherKind GetWeatherKind() {
-        auto sky = RE::Sky::GetSingleton();
+        auto* sky = RE::Sky::GetSingleton();
         if (!sky || !sky->currentWeather) {
             return WeatherKind::kNone;
         }
 
         auto* weather = sky->currentWeather;
+        auto flags = weather->data.flags;
 
-        if (weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kSnow)) {
+        if (flags.any(RE::TESWeather::WeatherDataFlag::kSnow)) {
             return WeatherKind::kSnow;
         }
 
-        if (weather->data.flags.any(RE::TESWeather::WeatherDataFlag::kRainy)) {
+        if (flags.any(RE::TESWeather::WeatherDataFlag::kRainy)) {
             return WeatherKind::kRain;
         }
 
         return WeatherKind::kNone;
     }
 
-    bool IsBadWeather(WeatherKind kind) { return kind == WeatherKind::kRain || kind == WeatherKind::kSnow; }
-
     void UpdateWeatherTransition(float now) {
-        auto sky = RE::Sky::GetSingleton();
-        auto currentWeather = sky ? sky->currentWeather : nullptr;
+        auto* sky = RE::Sky::GetSingleton();
+        auto* currentWeather = sky ? sky->currentWeather : nullptr;
 
         if (currentWeather != g_lastWeather) {
             g_lastWeather = currentWeather;
@@ -71,106 +131,117 @@ namespace {
 
     bool IsWeatherStable(float now) { return (now - g_lastWeatherChangeTime) >= kWeatherTransitionDelay; }
 
-    bool IsValidNPC(RE::Actor* actor) {
-        return actor && !actor->IsPlayerRef() && !actor->IsDead() && actor->GetActorBase();
-    }
+    void BuildGearPools() {
+        g_pools = {};
 
-    bool ShouldSkipState(RE::Actor* actor) { return actor && actor->IsInCombat(); }
-
-    bool IsOutside(RE::Actor* actor) {
-        auto cell = actor ? actor->GetParentCell() : nullptr;
-        return cell && cell->IsExteriorCell();
-    }
-
-    bool IsWithinUpdateRange(RE::Actor* actor, RE::PlayerCharacter* player) {
-        auto a = actor ? actor->GetPosition() : RE::NiPoint3{};
-        auto p = player ? player->GetPosition() : RE::NiPoint3{};
-
-        float dx = a.x - p.x;
-        float dy = a.y - p.y;
-        float dz = a.z - p.z;
-
-        return (dx * dx + dy * dy + dz * dz) <= kUpdateRadiusSquared;
-    }
-
-    RE::TESObjectARMO* FindArmorWithKeywordString(RE::Actor* actor, std::string_view keywordEditorID) {
-        if (!actor || keywordEditorID.empty()) {
-            return nullptr;
+        auto* dataHandler = RE::TESDataHandler::GetSingleton();
+        if (!dataHandler) {
+            return;
         }
 
-        auto inv = actor->GetInventory();
-        for (auto& [item, entry] : inv) {
-            if (!item) {
-                continue;
-            }
-
-            auto armor = item->As<RE::TESObjectARMO>();
+        auto& armors = dataHandler->GetFormArray<RE::TESObjectARMO>();
+        for (auto* armor : armors) {
             if (!armor) {
                 continue;
             }
 
-            if (armor->HasKeywordString(keywordEditorID)) {
-                return armor;
+            if (ArmorHasKeyword(armor, "WBNG_Hood_Rain")) {
+                g_pools.rainHoods.push_back(armor);
+            }
+            if (ArmorHasKeyword(armor, "WBNG_Hood_Snow")) {
+                g_pools.snowHoods.push_back(armor);
+            }
+            if (ArmorHasKeyword(armor, "WBNG_Cloak_Rain")) {
+                g_pools.rainCloaks.push_back(armor);
+            }
+            if (ArmorHasKeyword(armor, "WBNG_Cloak_Snow")) {
+                g_pools.snowCloaks.push_back(armor);
             }
         }
-
-        return nullptr;
     }
 
-    bool IsManagedHood(RE::TESObjectARMO* armor) {
-        if (!armor) {
-            return false;
-        }
-
-        return armor->HasKeywordString("WBNG_Hood_Rain") || armor->HasKeywordString("WBNG_Hood_Snow");
-    }
-
-    RE::TESObjectARMO* GetEquippedManagedHood(RE::Actor* actor) {
-        if (!actor) {
+    RE::TESObjectARMO* PickStableItem(RE::FormID actorID, const std::vector<RE::TESObjectARMO*>& pool,
+                                      std::uint32_t salt) {
+        if (pool.empty()) {
             return nullptr;
         }
 
-        auto inv = actor->GetInventory();
-        for (auto& [item, entry] : inv) {
-            if (!item) {
+        const auto index = HashActor(actorID, salt) % static_cast<std::uint32_t>(pool.size());
+        return pool[index];
+    }
+
+    RE::TESObjectARMO* PickDesiredHood(RE::FormID actorID, WeatherKind kind) {
+        switch (kind) {
+            case WeatherKind::kRain:
+                return PickStableItem(actorID, g_pools.rainHoods, 0xA1B2C3D4);
+            case WeatherKind::kSnow:
+                return PickStableItem(actorID, g_pools.snowHoods, 0xC4D3B2A1);
+            default:
+                return nullptr;
+        }
+    }
+
+    RE::TESObjectARMO* PickDesiredCloak(RE::FormID actorID, WeatherKind kind) {
+        switch (kind) {
+            case WeatherKind::kRain:
+                return PickStableItem(actorID, g_pools.rainCloaks, 0x11223344);
+            case WeatherKind::kSnow:
+                return PickStableItem(actorID, g_pools.snowCloaks, 0x44332211);
+            default:
+                return nullptr;
+        }
+    }
+
+    bool HasItemInInventory(RE::Actor* actor, RE::TESBoundObject* item) {
+        if (!actor || !item) {
+            return false;
+        }
+
+        auto inventory = actor->GetInventory();
+        return inventory.find(item) != inventory.end();
+    }
+
+    bool IsWearingItem(RE::Actor* actor, RE::TESObjectARMO* item) {
+        if (!actor || !item) {
+            return false;
+        }
+
+        auto inventory = actor->GetInventory();
+
+        for (auto it = inventory.begin(); it != inventory.end(); ++it) {
+            RE::TESBoundObject* obj = it->first;
+            auto& mapped = it->second;  // pair<count, unique_ptr<InventoryEntryData>>
+
+            if (obj != item) {
                 continue;
             }
 
-            auto armor = item->As<RE::TESObjectARMO>();
-            if (!armor) {
-                continue;
-            }
-
-            auto* invData = entry.second.get();
-            if (!invData || !invData->IsWorn()) {
-                continue;
-            }
-
-            if (IsManagedHood(armor)) {
-                return armor;
+            auto* entryData = mapped.second.get();
+            if (entryData && entryData->IsWorn()) {
+                return true;
             }
         }
 
-        return nullptr;
+        return false;
     }
 
-    bool HasBlockingHelmet(RE::Actor* actor, RE::TESBoundObject* activeHood) {
+    bool HasBlockingHeadgear(RE::Actor* actor, RE::TESObjectARMO* allowedHood) {
         if (!actor) {
             return false;
         }
 
-        constexpr RE::BGSBipedObjectForm::BipedObjectSlot kBlockedSlots[] = {
+        constexpr RE::BGSBipedObjectForm::BipedObjectSlot blockedSlots[] = {
             RE::BGSBipedObjectForm::BipedObjectSlot::kHead, RE::BGSBipedObjectForm::BipedObjectSlot::kHair,
             RE::BGSBipedObjectForm::BipedObjectSlot::kLongHair, RE::BGSBipedObjectForm::BipedObjectSlot::kCirclet,
             RE::BGSBipedObjectForm::BipedObjectSlot::kEars};
 
-        for (auto slot : kBlockedSlots) {
-            auto worn = actor->GetWornArmor(slot);
+        for (auto slot : blockedSlots) {
+            auto* worn = actor->GetWornArmor(slot);
             if (!worn) {
                 continue;
             }
 
-            if (worn == activeHood) {
+            if (worn == allowedHood) {
                 continue;
             }
 
@@ -180,92 +251,216 @@ namespace {
         return false;
     }
 
-    bool IsWearingManagedHood(RE::Actor* actor, RE::TESBoundObject* item) {
-        return GetEquippedManagedHood(actor) == item;
-    }
-
-    RE::TESBoundObject* GetSlot46Item(RE::Actor* actor) {
-        auto worn = actor ? actor->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kModChestPrimary) : nullptr;
-        return worn ? worn->As<RE::TESBoundObject>() : nullptr;
-    }
-
-    bool IsWearingItemInSlot46(RE::Actor* actor, RE::TESBoundObject* item) { return GetSlot46Item(actor) == item; }
-
-    bool IsWearingOtherSlot46Item(RE::Actor* actor, RE::TESBoundObject* item) {
-        auto worn = GetSlot46Item(actor);
-        return worn && worn != item;
-    }
-
-    void EquipItem(RE::Actor* actor, RE::TESBoundObject* item) {
-        auto mgr = RE::ActorEquipManager::GetSingleton();
-        if (mgr && actor && item) {
-            mgr->EquipObject(actor, item);
+    bool IsSlot46OccupiedByOther(RE::Actor* actor, RE::TESObjectARMO* allowedCloak) {
+        if (!actor) {
+            return false;
         }
+
+        auto* worn = actor->GetWornArmor(RE::BGSBipedObjectForm::BipedObjectSlot::kModChestPrimary);
+        return worn && worn != allowedCloak;
     }
 
-    bool UnequipItemNow(RE::Actor* actor, RE::TESBoundObject* item) {
-        auto mgr = RE::ActorEquipManager::GetSingleton();
-        return mgr && actor && item && mgr->UnequipObject(actor, item);
-    }
-
-    bool IsOnCooldown(RE::FormID id, float now) {
-        auto it = g_cooldownUntil.find(id);
-        return it != g_cooldownUntil.end() && now < it->second;
-    }
-
-    void StartCooldown(RE::FormID id, float now) { g_cooldownUntil[id] = now + RandomFloat(3.0f, 6.0f); }
-
-    void QueueEquip(RE::Actor* actor, RE::FormID id, float now) {
-        if (g_pendingEquipTime.contains(id)) {
+    void AddItemIfMissing(RE::Actor* actor, RE::TESObjectARMO* item, bool& addedByPlugin) {
+        if (!actor || !item) {
             return;
         }
 
-        bool isFemale = actor && actor->GetActorBase() && actor->GetActorBase()->GetSex() == RE::SEX::kFemale;
+        if (HasItemInInventory(actor, item)) {
+            addedByPlugin = false;
+            return;
+        }
 
-        float minDelay = isFemale ? 0.5f : 1.5f;
-        float maxDelay = isFemale ? 2.0f : 4.0f;
-
-        g_pendingEquipTime[id] = now + RandomFloat(minDelay, maxDelay);
+        actor->AddObjectToContainer(item, nullptr, 1, nullptr);
+        addedByPlugin = true;
     }
 
-    void QueueUnequipIndoor(RE::FormID id, float now) {
-        if (!g_pendingUnequipTime.contains(id)) {
-            g_pendingUnequipTime[id] = now + RandomFloat(0.2f, 1.0f);
+    void EquipItem(RE::Actor* actor, RE::TESObjectARMO* item) {
+        auto* equipMgr = RE::ActorEquipManager::GetSingleton();
+        if (equipMgr && actor && item) {
+            equipMgr->EquipObject(actor, item);
         }
     }
 
-    void QueueUnequipPleasant(RE::FormID id, float now) {
-        if (!g_pendingUnequipTime.contains(id)) {
-            g_pendingUnequipTime[id] = now + RandomFloat(1.0f, 3.0f);
+    void UnequipItem(RE::Actor* actor, RE::TESObjectARMO* item) {
+        auto* equipMgr = RE::ActorEquipManager::GetSingleton();
+        if (equipMgr && actor && item) {
+            equipMgr->UnequipObject(actor, item);
         }
     }
 
-    template <class TMap>
-    bool IsReady(const TMap& map, RE::FormID id, float now) {
-        auto it = map.find(id);
-        return it != map.end() && now >= it->second;
+    void RemoveManagedHood(RE::Actor* actor, ActorState& state) {
+        if (!actor || !state.managedHood) {
+            return;
+        }
+
+        if (IsWearingItem(actor, state.managedHood)) {
+            UnequipItem(actor, state.managedHood);
+        }
+
+        if (state.addedHoodToInventory) {
+            actor->RemoveItem(state.managedHood, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr,
+                              nullptr);
+        }
+
+        state.managedHood = nullptr;
+        state.addedHoodToInventory = false;
+    }
+
+    void RemoveManagedCloak(RE::Actor* actor, ActorState& state) {
+        if (!actor || !state.managedCloak) {
+            return;
+        }
+
+        if (IsWearingItem(actor, state.managedCloak)) {
+            UnequipItem(actor, state.managedCloak);
+        }
+
+        if (state.addedCloakToInventory) {
+            actor->RemoveItem(state.managedCloak, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr,
+                              nullptr);
+        }
+
+        state.managedCloak = nullptr;
+        state.addedCloakToInventory = false;
+    }
+
+    void EnsureManagedHood(RE::Actor* actor, RE::TESObjectARMO* desiredHood, ActorState& state) {
+        if (!actor) {
+            return;
+        }
+
+        if (!desiredHood) {
+            RemoveManagedHood(actor, state);
+            return;
+        }
+
+        if (state.managedHood && state.managedHood != desiredHood) {
+            RemoveManagedHood(actor, state);
+        }
+
+        if (HasBlockingHeadgear(actor, desiredHood)) {
+            RemoveManagedHood(actor, state);
+            return;
+        }
+
+        if (!state.managedHood) {
+            AddItemIfMissing(actor, desiredHood, state.addedHoodToInventory);
+            state.managedHood = desiredHood;
+        }
+
+        if (!IsWearingItem(actor, desiredHood)) {
+            EquipItem(actor, desiredHood);
+        }
+    }
+
+    void EnsureManagedCloak(RE::Actor* actor, RE::TESObjectARMO* desiredCloak, ActorState& state) {
+        if (!actor) {
+            return;
+        }
+
+        if (!desiredCloak) {
+            RemoveManagedCloak(actor, state);
+            return;
+        }
+
+        if (state.managedCloak && state.managedCloak != desiredCloak) {
+            RemoveManagedCloak(actor, state);
+        }
+
+        if (IsSlot46OccupiedByOther(actor, desiredCloak)) {
+            RemoveManagedCloak(actor, state);
+            return;
+        }
+
+        if (!state.managedCloak) {
+            AddItemIfMissing(actor, desiredCloak, state.addedCloakToInventory);
+            state.managedCloak = desiredCloak;
+        }
+
+        if (!IsWearingItem(actor, desiredCloak)) {
+            EquipItem(actor, desiredCloak);
+        }
+    }
+
+void ProcessActor(RE::Actor* actor, float now, WeatherKind weatherKind) {
+        if (!IsValidNPC(actor)) {
+            return;
+        }
+
+        if (ActorHasKeyword(actor, "WBNG_ExcludedNPC") || ActorHasKeyword(actor, "WBNG_NoWeatherGear")) {
+            auto& state = g_actorStates[actor->GetFormID()];
+            RemoveManagedHood(actor, state);
+            RemoveManagedCloak(actor, state);
+            return;
+        }
+
+        auto& state = g_actorStates[actor->GetFormID()];
+        if (now < state.nextAllowedUpdate) {
+            return;
+        }
+
+        const bool interior = IsInterior(actor);
+        const bool inCombat = actor->IsInCombat();
+
+        const bool allowRain = !ActorHasKeyword(actor, "WBNG_NoRainGear");
+        const bool allowSnow = !ActorHasKeyword(actor, "WBNG_NoSnowGear");
+        const bool allowHood = !ActorHasKeyword(actor, "WBNG_NoHood");
+        const bool allowCloak = !ActorHasKeyword(actor, "WBNG_NoCloak");
+
+        const bool weatherAllowed =
+            (weatherKind == WeatherKind::kRain && allowRain) || (weatherKind == WeatherKind::kSnow && allowSnow);
+
+        if (interior) {
+            RemoveManagedHood(actor, state);
+            RemoveManagedCloak(actor, state);
+            state.nextAllowedUpdate = now + RandomFloat(0.5f, 1.5f);
+            return;
+        }
+
+        // Clear weather: always remove everything, even in combat
+        if (!weatherAllowed) {
+            RemoveManagedHood(actor, state);
+            RemoveManagedCloak(actor, state);
+            state.nextAllowedUpdate = now + RandomFloat(1.0f, 3.0f);
+            return;
+        }
+
+        // Bad weather from here
+        auto* desiredHood = allowHood ? PickDesiredHood(actor->GetFormID(), weatherKind) : nullptr;
+        auto* desiredCloak = allowCloak ? PickDesiredCloak(actor->GetFormID(), weatherKind) : nullptr;
+
+        // Combat override: cloak off, hood still allowed
+        if (inCombat) {
+            EnsureManagedHood(actor, desiredHood, state);
+            RemoveManagedCloak(actor, state);
+            state.nextAllowedUpdate = now + RandomFloat(1.0f, 2.5f);
+            return;
+        }
+
+        EnsureManagedHood(actor, desiredHood, state);
+        EnsureManagedCloak(actor, desiredCloak, state);
+        state.nextAllowedUpdate = now + RandomFloat(2.0f, 4.0f);
     }
 
     void UpdateLoadedActors() {
-        auto lists = RE::ProcessLists::GetSingleton();
-        auto player = RE::PlayerCharacter::GetSingleton();
+        auto* lists = RE::ProcessLists::GetSingleton();
+        auto* player = RE::PlayerCharacter::GetSingleton();
         if (!lists || !player) {
             return;
         }
 
-        float now = GetNowSeconds();
+        const float now = GetNowSeconds();
 
         UpdateWeatherTransition(now);
         if (!IsWeatherStable(now)) {
             return;
         }
 
-        WeatherKind weatherKind = GetWeatherKind();
-        bool badWeather = IsBadWeather(weatherKind);
+        const auto weatherKind = GetWeatherKind();
 
         for (auto& handle : lists->highActorHandles) {
             auto actor = handle.get().get();
-            if (!IsValidNPC(actor)) {
+            if (!actor) {
                 continue;
             }
 
@@ -273,184 +468,63 @@ namespace {
                 continue;
             }
 
-            auto rainHood = FindArmorWithKeywordString(actor, "WBNG_Hood_Rain");
-            auto snowHood = FindArmorWithKeywordString(actor, "WBNG_Hood_Snow");
-            auto rainCloak = FindArmorWithKeywordString(actor, "WBNG_Cloak_Rain");
-            auto snowCloak = FindArmorWithKeywordString(actor, "WBNG_Cloak_Snow");
-
-            RE::TESObjectARMO* activeHood = nullptr;
-            RE::TESObjectARMO* activeCloak = nullptr;
-
-            if (weatherKind == WeatherKind::kRain) {
-                activeHood = rainHood;
-                activeCloak = rainCloak;
-            } else if (weatherKind == WeatherKind::kSnow) {
-                activeHood = snowHood;
-                activeCloak = snowCloak;
-            }
-
-            if (!rainHood && !snowHood && !rainCloak && !snowCloak) {
-                continue;
-            }
-
-            auto id = actor->GetFormID();
-            bool outside = IsOutside(actor);
-
-            bool wearingRainHood = rainHood && IsWearingManagedHood(actor, rainHood);
-            bool wearingSnowHood = snowHood && IsWearingManagedHood(actor, snowHood);
-            bool wearingActiveHood = activeHood && IsWearingManagedHood(actor, activeHood);
-            bool hasBlockingHelmet = HasBlockingHelmet(actor, activeHood);
-
-            bool wearingRainCloak = rainCloak && IsWearingItemInSlot46(actor, rainCloak);
-            bool wearingSnowCloak = snowCloak && IsWearingItemInSlot46(actor, snowCloak);
-            bool wearingActiveCloak = activeCloak && IsWearingItemInSlot46(actor, activeCloak);
-            bool wearingOtherSlot46 = activeCloak && IsWearingOtherSlot46Item(actor, activeCloak);
-
-            if (ShouldSkipState(actor)) {
-                g_pendingEquipTime.erase(id);
-
-                QueueUnequipPleasant(id, now);
-
-                if (IsReady(g_pendingUnequipTime, id, now)) {
-                    bool changed = false;
-
-                    if (rainCloak) {
-                        changed |= UnequipItemNow(actor, rainCloak);
-                    }
-                    if (snowCloak) {
-                        changed |= UnequipItemNow(actor, snowCloak);
-                    }
-
-                    if (changed) {
-                        actor->EvaluatePackage(false, true);
-                        StartCooldown(id, now);
-                    }
-
-                    g_pendingUnequipTime.erase(id);
-                }
-
-                continue;
-            }
-
-            if (IsOnCooldown(id, now)) {
-                continue;
-            }
-
-            if (outside && badWeather) {
-                g_pendingUnequipTime.erase(id);
-
-                bool removedWrongSeasonItem = false;
-
-                if (weatherKind == WeatherKind::kRain) {
-                    if (wearingSnowHood && snowHood) {
-                        removedWrongSeasonItem |= UnequipItemNow(actor, snowHood);
-                    }
-                    if (wearingSnowCloak && snowCloak) {
-                        removedWrongSeasonItem |= UnequipItemNow(actor, snowCloak);
-                    }
-                } else if (weatherKind == WeatherKind::kSnow) {
-                    if (wearingRainHood && rainHood) {
-                        removedWrongSeasonItem |= UnequipItemNow(actor, rainHood);
-                    }
-                    if (wearingRainCloak && rainCloak) {
-                        removedWrongSeasonItem |= UnequipItemNow(actor, rainCloak);
-                    }
-                }
-
-                if (removedWrongSeasonItem) {
-                    actor->EvaluatePackage(false, true);
-                    StartCooldown(id, now);
-                    g_pendingEquipTime.erase(id);
-                    continue;
-                }
-
-                bool canEquipHood = activeHood && !wearingActiveHood && !hasBlockingHelmet;
-                bool canEquipCloak = activeCloak && !wearingActiveCloak && !wearingOtherSlot46;
-
-                if (canEquipHood || canEquipCloak) {
-                    QueueEquip(actor, id, now);
-
-                    if (IsReady(g_pendingEquipTime, id, now)) {
-                        if (canEquipHood) {
-                            EquipItem(actor, activeHood);
-                        }
-                        if (canEquipCloak) {
-                            EquipItem(actor, activeCloak);
-                        }
-
-                        g_pendingEquipTime.erase(id);
-                        StartCooldown(id, now);
-                    }
-                } else {
-                    g_pendingEquipTime.erase(id);
-                }
-            } else {
-                g_pendingEquipTime.erase(id);
-
-                if (!outside) {
-                    QueueUnequipIndoor(id, now);
-                } else {
-                    QueueUnequipPleasant(id, now);
-                }
-
-                if (IsReady(g_pendingUnequipTime, id, now)) {
-                    bool changed = false;
-
-                    if (rainHood) {
-                        changed |= UnequipItemNow(actor, rainHood);
-                    }
-                    if (snowHood) {
-                        changed |= UnequipItemNow(actor, snowHood);
-                    }
-                    if (rainCloak) {
-                        changed |= UnequipItemNow(actor, rainCloak);
-                    }
-                    if (snowCloak) {
-                        changed |= UnequipItemNow(actor, snowCloak);
-                    }
-
-                    if (changed) {
-                        actor->EvaluatePackage(false, true);
-                        StartCooldown(id, now);
-                    }
-
-                    g_pendingUnequipTime.erase(id);
-                }
-            }
+            ProcessActor(actor, now, weatherKind);
         }
     }
 
-    void StartWeatherTicker() {
+    void StartTicker() {
         if (g_running) {
             return;
         }
 
         g_running = true;
-
         g_worker = std::thread([] {
             while (g_running) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                std::this_thread::sleep_for(kTickerInterval);
 
-                auto task = SKSE::GetTaskInterface();
+                auto* task = SKSE::GetTaskInterface();
                 if (task) {
                     task->AddTask(UpdateLoadedActors);
                 }
             }
         });
     }
+
+    [[maybe_unused]] void StopTicker() {
+        g_running = false;
+
+        if (g_worker.joinable()) {
+            g_worker.join();
+        }
+    }
 }
 
 SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::Init(skse);
 
-    SKSE::GetMessagingInterface()->RegisterListener([](SKSE::MessagingInterface::Message* msg) {
-        if (msg->type == SKSE::MessagingInterface::kDataLoaded) {
-            UpdateLoadedActors();
-            StartWeatherTicker();
+    auto* messaging = SKSE::GetMessagingInterface();
+    if (!messaging) {
+        return false;
+    }
+
+    messaging->RegisterListener([](SKSE::MessagingInterface::Message* msg) {
+        if (!msg) {
+            return;
         }
 
-        if (msg->type == SKSE::MessagingInterface::kPostLoadGame) {
-            UpdateLoadedActors();
+        switch (msg->type) {
+            case SKSE::MessagingInterface::kDataLoaded:
+                BuildGearPools();
+                UpdateLoadedActors();
+                StartTicker();
+                break;
+
+            case SKSE::MessagingInterface::kPostLoadGame:
+                UpdateLoadedActors();
+                break;
+
+            default:
+                break;
         }
     });
 
