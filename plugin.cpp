@@ -387,7 +387,7 @@ void ProcessActor(RE::Actor* actor, float now, WeatherKind weatherKind) {
             return;
         }
 
-        if (ActorHasKeyword(actor, "WBNG_ExcludedNPC") || ActorHasKeyword(actor, "WBNG_NoWeatherGear")) {
+        if (ActorHasKeyword(actor, "WBNG_ExcludedNPC")) {
             auto& state = g_actorStates[actor->GetFormID()];
             RemoveManagedHood(actor, state);
             RemoveManagedCloak(actor, state);
