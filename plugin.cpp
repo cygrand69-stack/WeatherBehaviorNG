@@ -1,7 +1,11 @@
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <random>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -12,14 +16,29 @@
 #include "SKSE/SKSE.h"
 
 namespace {
+    struct Config {
+        float updateRadius = 6000.0f;
+        float weatherTransitionDelay = 3.0f;
+        int tickerIntervalMs = 500;
+
+        float interiorUnequipMin = 0.5f;
+        float interiorUnequipMax = 1.5f;
+
+        float weatherEquipMin = 2.0f;
+        float weatherEquipMax = 4.0f;
+
+        float clearUnequipMin = 1.0f;
+        float clearUnequipMax = 3.0f;
+
+        bool disableCloaksInCombat = true;
+    };
+
     std::atomic_bool g_running = false;
     std::thread g_worker;
     std::mt19937 g_rng(std::random_device{}());
 
-    constexpr float kUpdateRadius = 6000.0f;
-    constexpr float kUpdateRadiusSquared = kUpdateRadius * kUpdateRadius;
-    constexpr float kWeatherTransitionDelay = 3.0f;
-    constexpr std::chrono::milliseconds kTickerInterval(500);
+    Config g_config{};
+    float g_updateRadiusSquared = g_config.updateRadius * g_config.updateRadius;
 
     enum class WeatherKind { kNone, kRain, kSnow };
 
@@ -53,6 +72,10 @@ namespace {
     }
 
     float RandomFloat(float minValue, float maxValue) {
+        if (maxValue < minValue) {
+            std::swap(minValue, maxValue);
+        }
+
         std::uniform_real_distribution<float> dist(minValue, maxValue);
         return dist(g_rng);
     }
@@ -67,6 +90,162 @@ namespace {
         return x;
     }
 
+    std::string Trim(std::string value) {
+        auto notSpace = [](unsigned char ch) { return !std::isspace(ch); };
+
+        value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
+        value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
+        return value;
+    }
+
+    std::string ToLower(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value;
+    }
+
+    bool ParseBool(const std::string& value, bool defaultValue) {
+        const auto lowered = ToLower(Trim(value));
+
+        if (lowered == "true" || lowered == "1" || lowered == "yes" || lowered == "on") {
+            return true;
+        }
+
+        if (lowered == "false" || lowered == "0" || lowered == "no" || lowered == "off") {
+            return false;
+        }
+
+        return defaultValue;
+    }
+
+    float ParseFloat(const std::string& value, float defaultValue) {
+        try {
+            return std::stof(Trim(value));
+        } catch (...) {
+            return defaultValue;
+        }
+    }
+
+    int ParseInt(const std::string& value, int defaultValue) {
+        try {
+            return std::stoi(Trim(value));
+        } catch (...) {
+            return defaultValue;
+        }
+    }
+
+    void ApplyConfigSanity() {
+        if (g_config.updateRadius < 0.0f) {
+            g_config.updateRadius = 0.0f;
+        }
+
+        if (g_config.weatherTransitionDelay < 0.0f) {
+            g_config.weatherTransitionDelay = 0.0f;
+        }
+
+        if (g_config.tickerIntervalMs < 50) {
+            g_config.tickerIntervalMs = 50;
+        }
+
+        if (g_config.interiorUnequipMin < 0.0f) {
+            g_config.interiorUnequipMin = 0.0f;
+        }
+        if (g_config.interiorUnequipMax < 0.0f) {
+            g_config.interiorUnequipMax = 0.0f;
+        }
+        if (g_config.weatherEquipMin < 0.0f) {
+            g_config.weatherEquipMin = 0.0f;
+        }
+        if (g_config.weatherEquipMax < 0.0f) {
+            g_config.weatherEquipMax = 0.0f;
+        }
+        if (g_config.clearUnequipMin < 0.0f) {
+            g_config.clearUnequipMin = 0.0f;
+        }
+        if (g_config.clearUnequipMax < 0.0f) {
+            g_config.clearUnequipMax = 0.0f;
+        }
+
+        if (g_config.interiorUnequipMax < g_config.interiorUnequipMin) {
+            std::swap(g_config.interiorUnequipMin, g_config.interiorUnequipMax);
+        }
+        if (g_config.weatherEquipMax < g_config.weatherEquipMin) {
+            std::swap(g_config.weatherEquipMin, g_config.weatherEquipMax);
+        }
+        if (g_config.clearUnequipMax < g_config.clearUnequipMin) {
+            std::swap(g_config.clearUnequipMin, g_config.clearUnequipMax);
+        }
+
+        g_updateRadiusSquared = g_config.updateRadius * g_config.updateRadius;
+    }
+
+    void LoadConfig() {
+        g_config = Config{};
+        std::ifstream file("Data\\SKSE\\Plugins\\WeatherBehaviorNG.ini");
+        if (!file.is_open()) {
+            ApplyConfigSanity();
+            return;
+        }
+
+        std::string line;
+        std::string section;
+
+        while (std::getline(file, line)) {
+            line = Trim(line);
+
+            if (line.empty()) {
+                continue;
+            }
+
+            if (line[0] == ';' || line[0] == '#') {
+                continue;
+            }
+
+            if (line.front() == '[' && line.back() == ']') {
+                section = ToLower(Trim(line.substr(1, line.size() - 2)));
+                continue;
+            }
+
+            const auto equalsPos = line.find('=');
+            if (equalsPos == std::string::npos) {
+                continue;
+            }
+
+            const std::string key = ToLower(Trim(line.substr(0, equalsPos)));
+            const std::string value = Trim(line.substr(equalsPos + 1));
+
+            if (section == "general") {
+                if (key == "fupdateradius") {
+                    g_config.updateRadius = ParseFloat(value, g_config.updateRadius);
+                } else if (key == "fweathertransitiondelay") {
+                    g_config.weatherTransitionDelay = ParseFloat(value, g_config.weatherTransitionDelay);
+                } else if (key == "itickerintervalms") {
+                    g_config.tickerIntervalMs = ParseInt(value, g_config.tickerIntervalMs);
+                }
+            } else if (section == "timing") {
+                if (key == "finteriorunequipmin") {
+                    g_config.interiorUnequipMin = ParseFloat(value, g_config.interiorUnequipMin);
+                } else if (key == "finteriorunequipmax") {
+                    g_config.interiorUnequipMax = ParseFloat(value, g_config.interiorUnequipMax);
+                } else if (key == "fweatherequipmin") {
+                    g_config.weatherEquipMin = ParseFloat(value, g_config.weatherEquipMin);
+                } else if (key == "fweatherequipmax") {
+                    g_config.weatherEquipMax = ParseFloat(value, g_config.weatherEquipMax);
+                } else if (key == "fclearunequipmin") {
+                    g_config.clearUnequipMin = ParseFloat(value, g_config.clearUnequipMin);
+                } else if (key == "fclearunequipmax") {
+                    g_config.clearUnequipMax = ParseFloat(value, g_config.clearUnequipMax);
+                }
+            } else if (section == "combat") {
+                if (key == "bdisablecloaksincombat") {
+                    g_config.disableCloaksInCombat = ParseBool(value, g_config.disableCloaksInCombat);
+                }
+            }
+        }
+
+        ApplyConfigSanity();
+    }
+
     bool ArmorHasKeyword(RE::TESObjectARMO* armor, std::string_view keywordEditorID) {
         return armor && armor->HasKeywordString(keywordEditorID);
     }
@@ -76,7 +255,8 @@ namespace {
     }
 
     bool IsValidNPC(RE::Actor* actor) {
-        return actor && !actor->IsPlayerRef() && !actor->IsDead() && actor->GetActorBase();
+        return actor && !actor->IsPlayerRef() && !actor->IsDead() && actor->GetActorBase() &&
+               actor->HasKeywordString("ActorTypeNPC");
     }
 
     bool IsWithinUpdateRange(RE::Actor* actor, RE::PlayerCharacter* player) {
@@ -91,7 +271,7 @@ namespace {
         const float dy = a.y - p.y;
         const float dz = a.z - p.z;
 
-        return (dx * dx + dy * dy + dz * dz) <= kUpdateRadiusSquared;
+        return (dx * dx + dy * dy + dz * dz) <= g_updateRadiusSquared;
     }
 
     bool IsInterior(RE::Actor* actor) {
@@ -129,7 +309,7 @@ namespace {
         }
     }
 
-    bool IsWeatherStable(float now) { return (now - g_lastWeatherChangeTime) >= kWeatherTransitionDelay; }
+    bool IsWeatherStable(float now) { return (now - g_lastWeatherChangeTime) >= g_config.weatherTransitionDelay; }
 
     void BuildGearPools() {
         g_pools = {};
@@ -210,7 +390,7 @@ namespace {
 
         for (auto it = inventory.begin(); it != inventory.end(); ++it) {
             RE::TESBoundObject* obj = it->first;
-            auto& mapped = it->second;  // pair<count, unique_ptr<InventoryEntryData>>
+            auto& mapped = it->second;
 
             if (obj != item) {
                 continue;
@@ -382,7 +562,7 @@ namespace {
         }
     }
 
-void ProcessActor(RE::Actor* actor, float now, WeatherKind weatherKind) {
+    void ProcessActor(RE::Actor* actor, float now, WeatherKind weatherKind) {
         if (!IsValidNPC(actor)) {
             return;
         }
@@ -413,33 +593,30 @@ void ProcessActor(RE::Actor* actor, float now, WeatherKind weatherKind) {
         if (interior) {
             RemoveManagedHood(actor, state);
             RemoveManagedCloak(actor, state);
-            state.nextAllowedUpdate = now + RandomFloat(0.5f, 1.5f);
+            state.nextAllowedUpdate = now + RandomFloat(g_config.interiorUnequipMin, g_config.interiorUnequipMax);
             return;
         }
 
-        // Clear weather: always remove everything, even in combat
         if (!weatherAllowed) {
             RemoveManagedHood(actor, state);
             RemoveManagedCloak(actor, state);
-            state.nextAllowedUpdate = now + RandomFloat(1.0f, 3.0f);
+            state.nextAllowedUpdate = now + RandomFloat(g_config.clearUnequipMin, g_config.clearUnequipMax);
             return;
         }
 
-        // Bad weather from here
         auto* desiredHood = allowHood ? PickDesiredHood(actor->GetFormID(), weatherKind) : nullptr;
         auto* desiredCloak = allowCloak ? PickDesiredCloak(actor->GetFormID(), weatherKind) : nullptr;
 
-        // Combat override: cloak off, hood still allowed
-        if (inCombat) {
+        if (inCombat && g_config.disableCloaksInCombat) {
             EnsureManagedHood(actor, desiredHood, state);
             RemoveManagedCloak(actor, state);
-            state.nextAllowedUpdate = now + RandomFloat(1.0f, 2.5f);
+            state.nextAllowedUpdate = now + RandomFloat(g_config.clearUnequipMin, g_config.clearUnequipMax);
             return;
         }
 
         EnsureManagedHood(actor, desiredHood, state);
         EnsureManagedCloak(actor, desiredCloak, state);
-        state.nextAllowedUpdate = now + RandomFloat(2.0f, 4.0f);
+        state.nextAllowedUpdate = now + RandomFloat(g_config.weatherEquipMin, g_config.weatherEquipMax);
     }
 
     void UpdateLoadedActors() {
@@ -480,7 +657,7 @@ void ProcessActor(RE::Actor* actor, float now, WeatherKind weatherKind) {
         g_running = true;
         g_worker = std::thread([] {
             while (g_running) {
-                std::this_thread::sleep_for(kTickerInterval);
+                std::this_thread::sleep_for(std::chrono::milliseconds(g_config.tickerIntervalMs));
 
                 auto* task = SKSE::GetTaskInterface();
                 if (task) {
@@ -501,6 +678,8 @@ void ProcessActor(RE::Actor* actor, float now, WeatherKind weatherKind) {
 
 SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::Init(skse);
+
+    LoadConfig();
 
     auto* messaging = SKSE::GetMessagingInterface();
     if (!messaging) {
