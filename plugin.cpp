@@ -34,6 +34,7 @@ namespace {
     };
 
     std::atomic_bool g_running = false;
+    std::atomic_bool g_runtimeReady = false;
     std::thread g_worker;
     std::mt19937 g_rng(std::random_device{}());
 
@@ -279,6 +280,16 @@ namespace {
         return cell ? cell->IsInteriorCell() : false;
     }
 
+    bool IsInventoryLikeMenuOpen() {
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui) {
+            return false;
+        }
+
+        return ui->IsMenuOpen("ContainerMenu") || ui->IsMenuOpen("InventoryMenu") || ui->IsMenuOpen("BarterMenu") ||
+               ui->IsMenuOpen("GiftMenu");
+    }
+
     WeatherKind GetWeatherKind() {
         auto* sky = RE::Sky::GetSingleton();
         if (!sky || !sky->currentWeather) {
@@ -403,6 +414,44 @@ namespace {
         }
 
         return false;
+    }
+
+    bool IsManagedCloak(RE::TESObjectARMO* armor) {
+        return armor && (ArmorHasKeyword(armor, "WBNG_Cloak_Rain") || ArmorHasKeyword(armor, "WBNG_Cloak_Snow"));
+    }
+
+    RE::TESObjectARMO* GetEquippedManagedCloak(RE::Actor* actor) {
+        if (!actor) {
+            return nullptr;
+        }
+
+        auto inventory = actor->GetInventory();
+
+        for (auto it = inventory.begin(); it != inventory.end(); ++it) {
+            auto* obj = it->first;
+            auto& mapped = it->second;
+
+            auto* armor = obj ? obj->As<RE::TESObjectARMO>() : nullptr;
+            if (!armor) {
+                continue;
+            }
+
+            if (!IsManagedCloak(armor)) {
+                continue;
+            }
+
+            auto* entryData = mapped.second.get();
+            if (entryData && entryData->IsWorn()) {
+                return armor;
+            }
+        }
+
+        return nullptr;
+    }
+
+    bool HasOtherManagedCloakEquipped(RE::Actor* actor, RE::TESObjectARMO* allowedCloak) {
+        auto* wornManagedCloak = GetEquippedManagedCloak(actor);
+        return wornManagedCloak && wornManagedCloak != allowedCloak;
     }
 
     bool HasBlockingHeadgear(RE::Actor* actor, RE::TESObjectARMO* allowedHood) {
@@ -547,6 +596,10 @@ namespace {
             RemoveManagedCloak(actor, state);
         }
 
+        if (HasOtherManagedCloakEquipped(actor, desiredCloak)) {
+            return;
+        }
+
         if (IsSlot46OccupiedByOther(actor, desiredCloak)) {
             RemoveManagedCloak(actor, state);
             return;
@@ -620,6 +673,14 @@ namespace {
     }
 
     void UpdateLoadedActors() {
+        if (!g_runtimeReady) {
+            return;
+        }
+
+        if (IsInventoryLikeMenuOpen()) {
+            return;
+        }
+
         auto* lists = RE::ProcessLists::GetSingleton();
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!lists || !player) {
@@ -679,8 +740,6 @@ namespace {
 SKSEPluginLoad(const SKSE::LoadInterface* skse) {
     SKSE::Init(skse);
 
-    LoadConfig();
-
     auto* messaging = SKSE::GetMessagingInterface();
     if (!messaging) {
         return false;
@@ -693,12 +752,24 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse) {
 
         switch (msg->type) {
             case SKSE::MessagingInterface::kDataLoaded:
+                LoadConfig();
                 BuildGearPools();
-                UpdateLoadedActors();
-                StartTicker();
+                g_runtimeReady = false;
+                break;
+
+            case SKSE::MessagingInterface::kPreLoadGame:
+                g_runtimeReady = false;
                 break;
 
             case SKSE::MessagingInterface::kPostLoadGame:
+                g_runtimeReady = true;
+                StartTicker();
+                UpdateLoadedActors();
+                break;
+
+            case SKSE::MessagingInterface::kNewGame:
+                g_runtimeReady = true;
+                StartTicker();
                 UpdateLoadedActors();
                 break;
 
