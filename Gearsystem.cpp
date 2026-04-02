@@ -7,10 +7,12 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "Config.h"
+#include "Logger.h"
 #include "RE/A/AIProcess.h"
 #include "RE/Skyrim.h"
 #include "SKSE/SKSE.h"
@@ -42,6 +44,7 @@ namespace {
         bool addedScarfToInventory = false;
 
         float nextAllowedUpdate = 0.0f;
+        float pendingWeatherEquipTime = -1.0f;
     };
 
     GearPools g_pools;
@@ -49,6 +52,9 @@ namespace {
 
     RE::TESWeather* g_lastWeather = nullptr;
     float g_lastWeatherChangeTime = 0.0f;
+
+    constexpr float kStatePruneIntervalSeconds = 30.0f;
+    float g_nextStatePruneTime = 0.0f;
 
     float GetNowSeconds() {
         using Clock = std::chrono::steady_clock;
@@ -166,6 +172,8 @@ namespace {
         g_actorStates.clear();
         g_lastWeather = nullptr;
         g_lastWeatherChangeTime = 0.0f;
+        g_nextStatePruneTime = 0.0f;
+        WBNG_LOG_DEBUG("Runtime state reset");
     }
 
     void BuildGearPools() {
@@ -201,6 +209,12 @@ namespace {
                 g_pools.snowScarves.push_back(armor);
             }
         }
+
+        WBNG_LOG_INFO("Gear pools built | rainHoods="
+                      << g_pools.rainHoods.size() << " snowHoods=" << g_pools.snowHoods.size()
+                      << " rainCloaks=" << g_pools.rainCloaks.size() << " snowCloaks=" << g_pools.snowCloaks.size()
+                      << " rainScarves=" << g_pools.rainScarves.size()
+                      << " snowScarves=" << g_pools.snowScarves.size());
     }
 
     RE::TESObjectARMO* PickStableItem(RE::FormID actorID, const std::vector<RE::TESObjectARMO*>& pool,
@@ -279,12 +293,45 @@ namespace {
         return false;
     }
 
+    bool IsManagedHood(RE::TESObjectARMO* armor) {
+        return armor && (ArmorHasKeyword(armor, "WBNG_Hood_Rain") || ArmorHasKeyword(armor, "WBNG_Hood_Snow"));
+    }
+
     bool IsManagedCloak(RE::TESObjectARMO* armor) {
         return armor && (ArmorHasKeyword(armor, "WBNG_Cloak_Rain") || ArmorHasKeyword(armor, "WBNG_Cloak_Snow"));
     }
 
     bool IsManagedScarf(RE::TESObjectARMO* armor) {
         return armor && (ArmorHasKeyword(armor, "WBNG_Scarf_Rain") || ArmorHasKeyword(armor, "WBNG_Scarf_Snow"));
+    }
+
+    RE::TESObjectARMO* GetEquippedManagedHood(RE::Actor* actor) {
+        if (!actor) {
+            return nullptr;
+        }
+
+        auto inventory = actor->GetInventory();
+
+        for (auto it = inventory.begin(); it != inventory.end(); ++it) {
+            auto* obj = it->first;
+            auto& mapped = it->second;
+
+            auto* armor = obj ? obj->As<RE::TESObjectARMO>() : nullptr;
+            if (!armor) {
+                continue;
+            }
+
+            if (!IsManagedHood(armor)) {
+                continue;
+            }
+
+            auto* entryData = mapped.second.get();
+            if (entryData && entryData->IsWorn()) {
+                return armor;
+            }
+        }
+
+        return nullptr;
     }
 
     RE::TESObjectARMO* GetEquippedManagedCloak(RE::Actor* actor) {
@@ -343,6 +390,36 @@ namespace {
         }
 
         return nullptr;
+    }
+
+    void ReconcileManagedState(RE::Actor* actor, ActorState& state) {
+        if (!actor) {
+            return;
+        }
+
+        if (!state.managedHood) {
+            state.managedHood = GetEquippedManagedHood(actor);
+            if (state.managedHood) {
+                state.addedHoodToInventory = false;
+                WBNG_LOG_DEBUG("Reconciled hood | formID=0x" << std::hex << actor->GetFormID());
+            }
+        }
+
+        if (!state.managedCloak) {
+            state.managedCloak = GetEquippedManagedCloak(actor);
+            if (state.managedCloak) {
+                state.addedCloakToInventory = false;
+                WBNG_LOG_DEBUG("Reconciled cloak | formID=0x" << std::hex << actor->GetFormID());
+            }
+        }
+
+        if (!state.managedScarf) {
+            state.managedScarf = GetEquippedManagedScarf(actor);
+            if (state.managedScarf) {
+                state.addedScarfToInventory = false;
+                WBNG_LOG_DEBUG("Reconciled scarf | formID=0x" << std::hex << actor->GetFormID());
+            }
+        }
     }
 
     bool HasOtherManagedCloakEquipped(RE::Actor* actor, RE::TESObjectARMO* allowedCloak) {
@@ -420,6 +497,34 @@ namespace {
         return false;
     }
 
+    bool NeedsWeatherGear(RE::TESObjectARMO* desiredHood, RE::TESObjectARMO* desiredCloak,
+                          RE::TESObjectARMO* desiredScarf) {
+        return desiredHood || desiredCloak || desiredScarf;
+    }
+
+    void PruneActorStates(const std::unordered_set<RE::FormID>& loadedActorIDs, float now) {
+        if (now < g_nextStatePruneTime) {
+            return;
+        }
+
+        std::size_t removedCount = 0;
+
+        for (auto it = g_actorStates.begin(); it != g_actorStates.end();) {
+            if (loadedActorIDs.find(it->first) == loadedActorIDs.end()) {
+                it = g_actorStates.erase(it);
+                ++removedCount;
+            } else {
+                ++it;
+            }
+        }
+
+        g_nextStatePruneTime = now + kStatePruneIntervalSeconds;
+
+        if (removedCount > 0) {
+            WBNG_LOG_DEBUG("Pruned actor states | removed=" << removedCount << " remaining=" << g_actorStates.size());
+        }
+    }
+
     void AddItemIfMissing(RE::Actor* actor, RE::TESObjectARMO* item, bool& addedByPlugin) {
         if (!actor || !item) {
             return;
@@ -453,13 +558,18 @@ namespace {
             return;
         }
 
-        if (IsWearingItem(actor, state.managedHood)) {
-            UnequipItem(actor, state.managedHood);
+        auto* managed = state.managedHood;
+
+        if (IsWearingItem(actor, managed)) {
+            UnequipItem(actor, managed);
         }
 
         if (state.addedHoodToInventory) {
-            actor->RemoveItem(state.managedHood, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr,
-                              nullptr);
+            actor->RemoveItem(managed, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr, nullptr);
+        }
+
+        if (IsWearingItem(actor, managed)) {
+            return;
         }
 
         state.managedHood = nullptr;
@@ -471,13 +581,18 @@ namespace {
             return;
         }
 
-        if (IsWearingItem(actor, state.managedCloak)) {
-            UnequipItem(actor, state.managedCloak);
+        auto* managed = state.managedCloak;
+
+        if (IsWearingItem(actor, managed)) {
+            UnequipItem(actor, managed);
         }
 
         if (state.addedCloakToInventory) {
-            actor->RemoveItem(state.managedCloak, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr,
-                              nullptr);
+            actor->RemoveItem(managed, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr, nullptr);
+        }
+
+        if (IsWearingItem(actor, managed)) {
+            return;
         }
 
         state.managedCloak = nullptr;
@@ -489,13 +604,18 @@ namespace {
             return;
         }
 
-        if (IsWearingItem(actor, state.managedScarf)) {
-            UnequipItem(actor, state.managedScarf);
+        auto* managed = state.managedScarf;
+
+        if (IsWearingItem(actor, managed)) {
+            UnequipItem(actor, managed);
         }
 
         if (state.addedScarfToInventory) {
-            actor->RemoveItem(state.managedScarf, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr,
-                              nullptr);
+            actor->RemoveItem(managed, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr, nullptr, nullptr);
+        }
+
+        if (IsWearingItem(actor, managed)) {
+            return;
         }
 
         state.managedScarf = nullptr;
@@ -550,6 +670,7 @@ namespace {
         }
 
         if (HasConflictingWornArmor(actor, desiredCloak)) {
+            WBNG_LOG_DEBUG("Cloak blocked by worn armor conflict | formID=0x" << std::hex << actor->GetFormID());
             RemoveManagedCloak(actor, state);
             return;
         }
@@ -602,15 +723,18 @@ namespace {
             return;
         }
 
+        auto& state = g_actorStates[actor->GetFormID()];
+        ReconcileManagedState(actor, state);
+
         if (ActorHasKeyword(actor, "WBNG_ExcludedNPC")) {
-            auto& state = g_actorStates[actor->GetFormID()];
+            WBNG_LOG_DEBUG("Excluded NPC | formID=0x" << std::hex << actor->GetFormID());
+            state.pendingWeatherEquipTime = -1.0f;
             RemoveManagedHood(actor, state);
             RemoveManagedCloak(actor, state);
             RemoveManagedScarf(actor, state);
             return;
         }
 
-        auto& state = g_actorStates[actor->GetFormID()];
         if (now < state.nextAllowedUpdate) {
             return;
         }
@@ -634,6 +758,7 @@ namespace {
             (weatherKind == WeatherKind::kRain && allowRain) || (weatherKind == WeatherKind::kSnow && allowSnow);
 
         if (interior) {
+            state.pendingWeatherEquipTime = -1.0f;
             RemoveManagedHood(actor, state);
             RemoveManagedCloak(actor, state);
             RemoveManagedScarf(actor, state);
@@ -642,6 +767,7 @@ namespace {
         }
 
         if (!weatherAllowed) {
+            state.pendingWeatherEquipTime = -1.0f;
             RemoveManagedHood(actor, state);
             RemoveManagedCloak(actor, state);
             RemoveManagedScarf(actor, state);
@@ -652,6 +778,7 @@ namespace {
         auto* desiredHood = allowHood ? PickDesiredHood(actor->GetFormID(), weatherKind) : nullptr;
         auto* desiredCloak = allowCloak ? PickDesiredCloak(actor->GetFormID(), weatherKind) : nullptr;
         auto* desiredScarf = allowScarf ? PickDesiredScarf(actor->GetFormID(), weatherKind) : nullptr;
+
         const bool preferScarfOverCloak =
             desiredScarf && desiredCloak &&
             PassesStableChance(actor->GetFormID(), 0x51A2F00D, g_config.scarfInsteadOfCloakChancePercent);
@@ -662,10 +789,34 @@ namespace {
             desiredScarf = nullptr;
         }
 
+        const bool wantsAnyWeatherGear = NeedsWeatherGear(desiredHood, desiredCloak, desiredScarf);
+
+        if (!wantsAnyWeatherGear) {
+            state.pendingWeatherEquipTime = -1.0f;
+            RemoveManagedHood(actor, state);
+            RemoveManagedCloak(actor, state);
+            RemoveManagedScarf(actor, state);
+            state.nextAllowedUpdate = now + RandomFloat(g_config.clearUnequipMin, g_config.clearUnequipMax);
+            return;
+        }
+
+        if (!state.managedHood && !state.managedCloak && !state.managedScarf) {
+            if (state.pendingWeatherEquipTime < 0.0f) {
+                state.pendingWeatherEquipTime = now + RandomFloat(g_config.weatherEquipMin, g_config.weatherEquipMax);
+                WBNG_LOG_DEBUG("Queued weather equip | formID=0x" << std::hex << actor->GetFormID());
+                return;
+            }
+
+            if (now < state.pendingWeatherEquipTime) {
+                return;
+            }
+        }
+
         if (inCombat && g_config.disableCloaksInCombat) {
             EnsureManagedHood(actor, desiredHood, state);
             EnsureManagedScarf(actor, desiredScarf, state);
             RemoveManagedCloak(actor, state);
+            state.pendingWeatherEquipTime = -1.0f;
             state.nextAllowedUpdate = now + RandomFloat(g_config.clearUnequipMin, g_config.clearUnequipMax);
             return;
         }
@@ -673,6 +824,7 @@ namespace {
         EnsureManagedHood(actor, desiredHood, state);
         EnsureManagedCloak(actor, desiredCloak, state);
         EnsureManagedScarf(actor, desiredScarf, state);
+        state.pendingWeatherEquipTime = -1.0f;
         state.nextAllowedUpdate = now + RandomFloat(g_config.weatherEquipMin, g_config.weatherEquipMax);
     }
 
@@ -700,11 +852,16 @@ namespace {
 
         const auto weatherKind = GetWeatherKind();
 
+        std::unordered_set<RE::FormID> loadedActorIDs;
+        loadedActorIDs.reserve(lists->highActorHandles.size());
+
         for (auto& handle : lists->highActorHandles) {
             auto actor = handle.get().get();
             if (!actor) {
                 continue;
             }
+
+            loadedActorIDs.insert(actor->GetFormID());
 
             if (!IsWithinUpdateRange(actor, player)) {
                 continue;
@@ -712,6 +869,8 @@ namespace {
 
             ProcessActor(actor, now, weatherKind);
         }
+
+        PruneActorStates(loadedActorIDs, now);
     }
 
     void StartTicker() {
@@ -743,15 +902,16 @@ namespace {
 
 namespace WBNG {
     void OnDataLoaded() {
-        LoadConfig();
         ResetRuntimeState();
         BuildGearPools();
         g_runtimeReady = false;
+        WBNG_LOG_INFO("OnDataLoaded: gear pools built");
     }
 
     void OnPreLoadGame() {
         g_runtimeReady = false;
         ResetRuntimeState();
+        WBNG_LOG_INFO("OnPreLoadGame");
     }
 
     void OnPostLoadGame() {
@@ -759,6 +919,7 @@ namespace WBNG {
         g_runtimeReady = true;
         StartTicker();
         UpdateLoadedActors();
+        WBNG_LOG_INFO("OnPostLoadGame");
     }
 
     void OnNewGame() {
@@ -766,5 +927,6 @@ namespace WBNG {
         g_runtimeReady = true;
         StartTicker();
         UpdateLoadedActors();
+        WBNG_LOG_INFO("OnNewGame");
     }
 }

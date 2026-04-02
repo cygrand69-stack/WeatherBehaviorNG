@@ -15,10 +15,13 @@ find_package(CommonLibSSE CONFIG REQUIRED)
 add_commonlibsse_plugin(${PROJECT_NAME}
     SOURCES
         plugin.cpp
+		config.cpp
+		gearsystem.cpp
+        logger.cpp
 )
 target_precompile_headers(${PROJECT_NAME} PRIVATE PCH.h)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_23)
-
+target_compile_definitions(WeatherBehaviorNG PRIVATE _SILENCE_STDEXT_ARR_ITERS_DEPRECATION_WARNING)
 
 if(DEFINED OUTPUT_FOLDER)
     set(DLL_FOLDER "${OUTPUT_FOLDER}/SKSE/Plugins")

@@ -174,6 +174,10 @@ void LoadConfig() {
             } else if (key == "iscarfinsteadofcloakchancepercent") {
                 g_config.scarfInsteadOfCloakChancePercent = ParseInt(value, g_config.scarfInsteadOfCloakChancePercent);
             }
+        } else if (section == "debug") {
+            if (key == "benablelogging") {
+                g_config.enableLogging = ParseBool(value, g_config.enableLogging);
+            }
         } else if (section == "timing") {
             if (key == "finteriorunequipmin") {
                 g_config.interiorUnequipMin = ParseFloat(value, g_config.interiorUnequipMin);

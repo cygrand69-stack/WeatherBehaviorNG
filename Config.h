@@ -19,6 +19,8 @@ struct Config {
     int cloakChancePercent = 100;
     int scarfChancePercent = 35;
     int scarfInsteadOfCloakChancePercent = 25;
+
+    bool enableLogging = false;
 };
 
 extern Config g_config;
